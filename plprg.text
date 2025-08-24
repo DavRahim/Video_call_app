@@ -1,0 +1,204 @@
+create extension IF not exists "uuid-ossp";
+
+create extension IF not exists "pgcrypto";
+
+-- User table
+create table public.users (
+  id UUID references auth.users (id) on delete CASCADE primary key,
+  full_name TEXT not null,
+  username TEXT unique not null,
+  email TEXT unique NOT null,
+  gender TEXT check (gender in ('male', 'female', 'other')) not null,
+  birthdate DATE not null,
+  bio TEXT,
+  avatar_url TEXT,
+  preferences JSONB default '{"age_range": {"min": 18, "max":50}, "distance": 25, "gender_preference":[]}'::jsonb,
+  location_lat DECIMAL(10, 8),
+  location_lng DECIMAL(11, 8),
+  last_active timestamp with time zone default NOW(),
+  is_verified BOOLEAN default false,
+  is_online BOOLEAN default false,
+  created_at timestamp with time zone default NOW(),
+  updated_at timestamp with time zone default NOW()
+);
+
+-- Links table
+CREATE TABLE public.likes (
+  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  from_user_id UUID REFERENCES public.users(id) ON DELETE CASCADE NOT NULL,
+  to_user_id UUID REFERENCES public.users(id) ON DELETE CASCADE NOT NULL,
+  created_at timestamp with time zone default NOW(),
+  unique(from_user_id, to_user_id)
+);
+
+-- match table
+
+CREATE TABLE public.match (
+  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  user1_id UUID REFERENCES public.users(id) ON DELETE CASCADE NOT NULL,
+  user2_id UUID REFERENCES public.users(id) ON DELETE CASCADE NOT NULL,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at timestamp with time zone default NOW(),
+  unique(user1_id, user2_id)
+);
+
+
+-- Users table indexes
+CREATE INDEX idx_users_username ON public.users(username);
+CREATE INDEX idx_users_email ON public.users(email);
+CREATE INDEX idx_users_gender ON public.users(gender);
+CREATE INDEX idx_users_birthdate ON public.users(birthdate);
+CREATE INDEX idx_users_location ON public.users(location_lat, location_lng);
+CREATE INDEX idx_users_last_active ON public.users(last_active);
+CREATE INDEX idx_users_created_at ON public.users(created_at);
+
+
+-- Linkes table indexes
+CREATE INDEX idx_links_from_user ON public.likes(from_user_id);
+CREATE INDEX idx_links_to_user ON public.likes(to_user_id);
+CREATE INDEX idx_links_created_at ON public.likes(created_at);
+
+
+-- Matches table indexes
+CREATE INDEX idx_matches_user1 ON public.match(user1_id);
+CREATE INDEX idx_matches_user2 ON public.match(user2_id);
+CREATE INDEX idx_matches_created_at ON public.match(created_at);
+
+
+
+-- Function to update updated-at timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+   NEW.updated_at = NOW();
+   RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Trigger for users table
+
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON public.auth.users
+      FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Function o create match when both users like each others
+
+CREATE OR REPLACE FUNCTION create_match_on_mutual_like()
+RETURNS TRIGGER AS $$
+BEGIN 
+  --  Check if the other user has also liked this user
+   IF EXISTS(
+    SELECT 1 FROM public.likes
+    WHERE from_user_id = NEW.to_user_id
+    AND to_user_id = NEW.from_user_id
+   )THEN 
+    --  Create a match (avoid duplicates)
+    INSERT INTO public.matches (user1_id, user2_id)
+    VALUES(
+      LEAST(NEW.from_user_id, NEW.to_user_id),
+      GREATEST(NEW.from_user_id, NEW.to_user_id)
+    )
+    ON CONFLICT (user1_id, user2_id) DO NOTHING;
+ END IF;
+
+ RETURN NEW;
+END;
+$$ language 'plpgsql' SECURITY DEFINER;
+
+
+-- Trigger for creating match
+
+CREATE TRIGGER create_match_trigger AFTER INSERT ON public.likes
+     FoR EACH ROW EXECUTE FUNCTION create_match_on_mutual_like();
+
+-- Function to update user's last_active timestamp
+CREATE OR REPLACE FUNCTION update_last_active()
+RETURNS TRIGGER AS $$
+BEGIN
+  UPDATE public.users SET last_active = NOW() WHERE id = NEW.from_user_id;
+  RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Trigger for update last_active when user interats
+CREATE TRIGGER update_last_active_trigger AFTER INSERT ON public.likes
+   FOR EACH ROW EXECUTE FUNCTION update_last_active();
+
+
+-- Function to create user profile when user intercts;
+
+CREATE OR REPLACE FUNCTION handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN 
+    INSERT INTO public.users(
+      id,
+      full_name,
+      username,
+      email,
+      gender,
+      birthdate,
+      bio,
+      avatar_url,
+      preferences
+    )VALUES(
+      NEW.id,
+      COALESCE(NEW.raw_user_meta_data->>'full_name', split_part(NEW.email, '@', 1), 'User'),
+      COALESCE(NEW.raw_user_meta_data->>'username', split_part(NEW.email, '@', 1), 'user'),
+      NEW.email,
+      'other',
+      CURRENT_DATE,
+      '',
+      NULL,
+      '{"age_range": {"min":18, "max": 50}, "distance":25, "gender_preference": []}'::jsonb
+    );
+    RETURN NEW;
+END;
+$$ language 'plpgsql' SECURITY DEFINER;
+
+
+-- Trigger to create user profile on signup
+CREATE TRIGGER on_auth_user_created
+      AFTER INSERT ON auth.users
+      FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+
+
+-- Row LEVEL security
+
+--  enable RLS on all table
+ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.links ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.matches ENABLE ROW LEVEL SECURITY;
+
+-- Users table polices
+
+CREATE POLICY "User can view their own profile" ON public.users
+      FOR SELECT USING (auth.uid() = id);
+
+CREATE POLICY "User can Update their own profile" ON public.users
+      FOR UPDATE USING (auth.uid() = id);
+
+CREATE POLICY "Users can view other users for matchin" ON public.users
+     FOR SELECT USING (
+      auth.uid() IS NOT NULL
+      AND auth.uid() != id
+      AND id NOT IN(
+        SELECT blocked_user_id FROM public.user_blocks WHERE blocker_id = auth.uid()
+      )
+      AND id NOT IN(
+        SELECT blocker_id FROM public.user_blocks WHERE blocked_user_id = auth.uid()
+      )
+     ) ;         
+
+--  Links table policy
+CREATE POLICY "User can view their own likes" ON public.likes
+    FOR SELECT USING (auth.uid() = from_user_id OR auth.uid() = to_user_id);
+
+CREATE POLICY "User can create their own likes" ON public.likes
+    FOR INSERT USING (auth.uid() = from_user_id OR auth.uid() = to_user_id);
+
+CREATE POLICY "User can delete their own likes" ON public.likes
+    FOR DELETE USING (auth.uid() = from_user_id OR auth.uid() = to_user_id);
+
+
+-- Matches table policy
+CREATE POLICY "Users can view their matches" ON public.matches
+    FOR SELECT USING (auth.uid() = user1_id OR auth.uid() = user2_id)
